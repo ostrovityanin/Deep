@@ -1,0 +1,10 @@
+flask==3.1.1
+flask-cors==5.0.1
+gunicorn==23.0.0
+Pillow==11.1.0
+numpy==1.26.4
+scipy==1.14.1
+matplotlib==3.9.4
+torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cpu
+deepgaze-pytorch==1.0.2
