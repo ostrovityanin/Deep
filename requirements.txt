@@ -5,6 +5,7 @@ Pillow==11.1.0
 numpy==1.26.4
 scipy==1.14.1
 matplotlib==3.9.4
-torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
-torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cpu
-deepgaze-pytorch==1.0.2
+torch==2.5.1+cpu
+torchvision==0.20.1+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+git+https://github.com/matthias-k/DeepGaze.git@v1.2.0
