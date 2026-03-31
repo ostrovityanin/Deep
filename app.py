@@ -1,114 +1,115 @@
-"""
-DeepGaze III Heatmap API — для Timeweb App Platform (Flask)
-"""
+import os
 import io
 import base64
+import logging
+
 import numpy as np
+import torch
+from scipy.ndimage import zoom
+from scipy.special import logsumexp
 from PIL import Image
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-import torch
-import deepgaze_pytorch
-from scipy.ndimage import zoom as scipy_zoom
-from scipy.special import logsumexp
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
 
-# Загрузка модели при старте
-DEVICE = "cpu"
-model = deepgaze_pytorch.DeepGazeIII(pretrained=True).to(DEVICE)
-model.eval()
-
-# Центральная фиксация
-centerbias_template = np.zeros((1024, 1024))
+DEVICE = torch.device("cpu")
+model = None
 
 
-def make_heatmap(image_pil, alpha=0.5):
-    """Генерирует heatmap и overlay"""
-    img = np.array(image_pil.convert("RGB"))
-    h, w = img.shape[:2]
+def load_model():
+    global model
+    if model is not None:
+        return
+    logger.info("Loading DeepGaze IIE model (CPU)...")
+    from deepgaze_pytorch import DeepGazeIIE
+    model = DeepGazeIIE(pretrained=True).to(DEVICE)
+    model.eval()
+    logger.info("Model loaded successfully.")
 
-    # Resize для модели (макс 1024)
-    scale = min(1.0, 1024 / max(h, w))
-    new_h, new_w = int(h * scale), int(w * scale)
 
-    img_resized = np.array(image_pil.resize((new_w, new_h), Image.LANCZOS).convert("RGB"))
-    img_tensor = torch.tensor(img_resized.transpose(2, 0, 1)[np.newaxis], dtype=torch.float32).to(DEVICE)
-
-    centerbias = scipy_zoom(centerbias_template, (new_h / 1024, new_w / 1024), order=0, mode="nearest")
-    centerbias -= logsumexp(centerbias)
-    centerbias_tensor = torch.tensor(centerbias[np.newaxis, np.newaxis], dtype=torch.float32).to(DEVICE)
-
-    with torch.no_grad():
-        log_density = model(img_tensor, centerbias_tensor)
-
-    prediction = log_density.squeeze().cpu().numpy()
-    prediction = np.exp(prediction)
-    prediction = prediction / prediction.max()
-
-    # Масштабируем обратно
-    prediction_full = scipy_zoom(prediction, (h / new_h, w / new_w), order=1, mode="nearest")
-
-    # Heatmap
-    fig, ax = plt.subplots(1, 1, figsize=(w / 100, h / 100), dpi=100)
-    ax.imshow(prediction_full, cmap="jet", vmin=0, vmax=1)
-    ax.set_axis_off()
-    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-    buf_heatmap = io.BytesIO()
-    fig.savefig(buf_heatmap, format="png", bbox_inches="tight", pad_inches=0, dpi=100)
-    plt.close(fig)
-    buf_heatmap.seek(0)
-
-    # Overlay
-    fig2, ax2 = plt.subplots(1, 1, figsize=(w / 100, h / 100), dpi=100)
-    ax2.imshow(img)
-    ax2.imshow(prediction_full, cmap="jet", alpha=alpha, vmin=0, vmax=1)
-    ax2.set_axis_off()
-    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-    buf_overlay = io.BytesIO()
-    fig2.savefig(buf_overlay, format="png", bbox_inches="tight", pad_inches=0, dpi=100)
-    plt.close(fig2)
-    buf_overlay.seek(0)
-
-    return buf_heatmap, buf_overlay
+def make_centerbias(shape, sigma_frac=0.4):
+    h, w = shape
+    y = np.linspace(-1, 1, h)
+    x = np.linspace(-1, 1, w)
+    X, Y = np.meshgrid(x, y)
+    centerbias = np.exp(-0.5 * (X**2 + Y**2) / sigma_frac**2)
+    centerbias /= centerbias.sum()
+    return np.log(centerbias)
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "model_loaded": model is not None})
 
 
 @app.route("/predict", methods=["POST"])
 def predict():
+    load_model()
+
     if "image" not in request.files:
-        return jsonify({"error": "No image uploaded"}), 400
+        return jsonify({"error": "No image provided"}), 400
 
-    file = request.files["image"]
     alpha = float(request.form.get("alpha", 0.5))
+    file = request.files["image"]
+    img = Image.open(file.stream).convert("RGB")
+    original_size = img.size  # (W, H)
 
-    try:
-        image = Image.open(file.stream)
-    except Exception:
-        return jsonify({"error": "Invalid image"}), 400
+    # Resize for inference
+    input_size = (768, 1024)
+    img_resized = img.resize((input_size[1], input_size[0]), Image.BILINEAR)
+    img_np = np.array(img_resized).astype(np.float32)
 
-    try:
-        buf_heatmap, buf_overlay = make_heatmap(image, alpha)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    tensor = torch.tensor(img_np.transpose(2, 0, 1)[np.newaxis, ...]).to(DEVICE)
+    centerbias_tensor = torch.tensor(
+        make_centerbias(input_size)[np.newaxis, np.newaxis, ...]
+    ).float().to(DEVICE)
 
-    heatmap_b64 = base64.b64encode(buf_heatmap.read()).decode()
-    overlay_b64 = base64.b64encode(buf_overlay.read()).decode()
+    with torch.no_grad():
+        log_density = model(tensor, centerbias_tensor)
 
-    return jsonify({
-        "heatmap": heatmap_b64,
-        "overlay": overlay_b64,
-    })
+    log_density_np = log_density.cpu().numpy()[0, 0]
+    # Resize back to original
+    scale_h = original_size[1] / log_density_np.shape[0]
+    scale_w = original_size[0] / log_density_np.shape[1]
+    log_density_full = zoom(log_density_np, (scale_h, scale_w), order=1)
+    log_density_full -= logsumexp(log_density_full)
+    heatmap = np.exp(log_density_full)
+
+    # Heatmap image
+    fig, ax = plt.subplots(figsize=(original_size[0] / 100, original_size[1] / 100), dpi=100)
+    ax.imshow(heatmap, cmap="inferno")
+    ax.axis("off")
+    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+    buf_h = io.BytesIO()
+    fig.savefig(buf_h, format="png", bbox_inches="tight", pad_inches=0)
+    plt.close(fig)
+    buf_h.seek(0)
+    heatmap_b64 = base64.b64encode(buf_h.read()).decode()
+
+    # Overlay image
+    fig, ax = plt.subplots(figsize=(original_size[0] / 100, original_size[1] / 100), dpi=100)
+    ax.imshow(np.array(img))
+    ax.imshow(heatmap, cmap="inferno", alpha=alpha)
+    ax.axis("off")
+    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+    buf_o = io.BytesIO()
+    fig.savefig(buf_o, format="png", bbox_inches="tight", pad_inches=0)
+    plt.close(fig)
+    buf_o.seek(0)
+    overlay_b64 = base64.b64encode(buf_o.read()).decode()
+
+    return jsonify({"heatmap": heatmap_b64, "overlay": overlay_b64})
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    load_model()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
